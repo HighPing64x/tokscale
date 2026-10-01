@@ -407,6 +407,10 @@ struct CherryChatRow {
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
+    /// The ledger's own uncached share of the prompt, when the build has it.
+    /// This is exactly the bucket `TokenBreakdown::input` models, so it is
+    /// preferred over re-deriving it by subtraction.
+    no_cache_tokens: Option<i64>,
     cost: Option<f64>,
     created_at: Option<i64>,
     message_kind: Option<String>,
@@ -485,6 +489,28 @@ fn build_usage_query(conn: &Connection) -> Option<String> {
     } else {
         "NULL".to_string()
     };
+    // The ledger's own uncached-input count. Naming a column the build lacks
+    // would fail the whole statement to prepare and take the lane to zero, so
+    // it is probed like every other optional column and falls back to
+    // subtraction in the row mapping.
+    let no_cache_column = if has("no_cache_tokens") {
+        "r.no_cache_tokens"
+    } else {
+        "NULL"
+    };
+    // Provider and model are the row's identity, but a build that spells them
+    // differently must still degrade to "no usage" for those columns rather
+    // than to no rows at all.
+    let provider_column = if has("provider_id") {
+        "r.provider_id"
+    } else {
+        "NULL"
+    };
+    let model_column = if has("model_id") {
+        "r.model_id"
+    } else {
+        "NULL"
+    };
 
     // `message_kind` separates the two surfaces. A build without it cannot
     // tell them apart, so it must report every row: the caller's dedup key
@@ -517,8 +543,8 @@ fn build_usage_query(conn: &Connection) -> Option<String> {
             r.id,
             {message_id_column},
             {title_column},
-            r.provider_id,
-            r.model_id,
+            {provider_column},
+            {model_column},
             {input},
             {output},
             {cache_read},
@@ -526,12 +552,16 @@ fn build_usage_query(conn: &Connection) -> Option<String> {
             {reasoning},
             {cost},
             r.created_at,
-            {kind_column}
+            {kind_column},
+            {no_cache}
         FROM ai_usage_record r
             {joins}
         WHERE {record_kind_filter}{kind_filter}
         ORDER BY r.created_at, r.id",
         message_id_column = message_id_column,
+        provider_column = provider_column,
+        model_column = model_column,
+        no_cache = no_cache_column,
         input = if has("input_tokens") {
             "r.input_tokens"
         } else {
@@ -571,6 +601,17 @@ fn build_usage_query(conn: &Connection) -> Option<String> {
 /// "no usage" instead of failing to prepare. Only `record_kind = 'invocation'`
 /// rows are read: `legacy-aggregate` rows are pre-summed totals that would
 /// otherwise double count the same calls.
+///
+/// # Token buckets
+///
+/// The ledger's `input_tokens` and `output_tokens` are inclusive: the prompt
+/// count already contains both cache buckets and the completion count already
+/// contains reasoning. `TokenBreakdown` expects five non-overlapping buckets,
+/// so the cache reads, cache writes and reasoning tokens are moved out of
+/// input/output rather than added on top of them; otherwise `total()` counts
+/// every cache write and reasoning token twice. Cost comes from the ledger's
+/// own `cost` column and is marked provider-reported, so pricing cannot
+/// re-estimate it.
 ///
 /// # Why `agent-session` rows are excluded
 ///
@@ -614,6 +655,7 @@ pub fn parse_cherrystudio_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             cost: row.get(10)?,
             created_at: row.get(11)?,
             message_kind,
+            no_cache_tokens: row.get(13)?,
         });
         Ok(())
     });
@@ -647,18 +689,37 @@ pub fn parse_cherrystudio_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         let provider = clean_optional(row.provider_id.as_deref())
             .unwrap_or_else(|| provider_for_model(&model).to_string());
 
-        // `input_tokens` is the whole prompt and `cache_read_tokens` is the
-        // cached part of it. Counting both as input would report the cache hit
-        // twice, so mirror the transcript parser and keep the buckets apart.
+        // The ledger records `input_tokens` as the *whole* prompt and
+        // `output_tokens` as the whole completion, with the cache and
+        // reasoning shares counted again in their own columns: Cherry Studio
+        // derives its uncached input as
+        // `inputTokens - cacheReadTokens - cacheWriteTokens` and its text
+        // output as `outputTokens - reasoningTokens`
+        // (`AiUsageRecordService.ts`). `TokenBreakdown` instead models five
+        // non-overlapping buckets -- the same shape mismatch documented in
+        // `zcode::normalize_zcode_input_and_output` -- so feeding the raw
+        // columns through double counts every cache write and every reasoning
+        // token in `total()`.
         let cache_read = row.cache_read_tokens.unwrap_or(0).max(0);
-        let input = row
-            .input_tokens
-            .unwrap_or(0)
-            .max(0)
-            .saturating_sub(cache_read);
-        let output = row.output_tokens.unwrap_or(0).max(0);
         let cache_write = row.cache_write_tokens.unwrap_or(0).max(0);
         let reasoning = row.reasoning_tokens.unwrap_or(0).max(0);
+        // Prefer the ledger's own uncached count; otherwise subtract both cache
+        // buckets, which is the arithmetic Cherry Studio itself uses.
+        let input = match row.no_cache_tokens.map(|tokens| tokens.max(0)) {
+            Some(no_cache) => no_cache,
+            None => row
+                .input_tokens
+                .unwrap_or(0)
+                .max(0)
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write),
+        };
+        // `output_tokens` already contains the reasoning share.
+        let output = row
+            .output_tokens
+            .unwrap_or(0)
+            .max(0)
+            .saturating_sub(reasoning);
         let tokens = TokenBreakdown {
             input,
             output,
@@ -683,8 +744,13 @@ pub fn parse_cherrystudio_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         let mut message = UnifiedMessage::new(
             CLIENT_ID, model, provider, session_id, timestamp, tokens, cost,
         );
-        // The ledger computes this cost itself, so it must survive caching.
-        message.cost_source = if cost > 0.0 {
+        // The ledger computes this cost itself, so it must survive caching. A
+        // present `cost` is authoritative even when it is exactly zero: this
+        // schema treats explicit zero as observed data ("explicit zero-cost
+        // rows remain priced"), so re-estimating it would invent a charge for
+        // a free or local model. Only a NULL `cost` -- the ledger's "not
+        // available" -- is left to tokscale's own pricing.
+        message.cost_source = if row.cost.is_some() {
             CostSource::ProviderReported
         } else {
             CostSource::Estimated
@@ -1250,9 +1316,13 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_lane_subtracts_cache_reads_from_input() {
-        // `input_tokens` is the whole prompt including the cached part, so the
-        // cache hit must move into `cache_read` instead of being counted twice.
+    fn sqlite_lane_moves_cache_and_reasoning_shares_out_of_the_inclusive_totals() {
+        // The ledger's `input_tokens` is the whole prompt (cached part
+        // included) and `output_tokens` is the whole completion (reasoning
+        // included). `TokenBreakdown` has five non-overlapping buckets, so
+        // both shares must leave input/output instead of being added beside
+        // them -- otherwise `total()` counts every cache write and reasoning
+        // token twice.
         let dir = tempdir().unwrap();
         let path = dir.path().join("cherrystudio.sqlite");
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -1275,13 +1345,92 @@ mod tests {
         let messages = parse_cherrystudio_sqlite(&path);
         assert_eq!(messages.len(), 1);
         let tokens = &messages[0].tokens;
-        assert_eq!(
-            tokens.input, 200,
-            "cache-read share leaves the input bucket"
-        );
+        // Both the cache-read and the cache-write share leave the input bucket.
+        assert_eq!(tokens.input, 150);
+        // The reasoning share leaves the output bucket.
+        assert_eq!(tokens.output, 175);
         assert_eq!(tokens.cache_read, 800);
         assert_eq!(tokens.cache_write, 50);
         assert_eq!(tokens.reasoning, 25);
+        // The invariant that catches the double counting: the buckets must
+        // still add up to the ledger's own `input_tokens + output_tokens`.
+        assert_eq!(tokens.total(), 1000 + 200);
+    }
+
+    #[test]
+    fn sqlite_lane_prefers_the_ledgers_own_no_cache_tokens() {
+        // When the build carries `no_cache_tokens`, that column is the ledger
+        // stating the uncached share outright, so it wins over re-deriving it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cherrystudio.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                 id TEXT PRIMARY KEY, record_kind TEXT, message_kind TEXT, message_id TEXT,
+                 provider_id TEXT, model_id TEXT, input_tokens INTEGER, output_tokens INTEGER,
+                 total_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                 cache_write_tokens INTEGER, reasoning_tokens INTEGER,
+                 cost REAL, created_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_usage_record VALUES
+                ('r1','invocation','chat',NULL,'deepseek','deepseek-flash',
+                 10000,1000,11000,2000,7500,500,400,0.01,1780000000000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_cherrystudio_sqlite(&path);
+        assert_eq!(messages.len(), 1);
+        let tokens = &messages[0].tokens;
+        assert_eq!(tokens.input, 2000, "no_cache_tokens is used verbatim");
+        assert_eq!(tokens.output, 600, "reasoning leaves the output bucket");
+        assert_eq!(tokens.total(), 11000, "buckets sum to total_tokens");
+    }
+
+    #[test]
+    fn sqlite_lane_keeps_an_explicit_zero_cost() {
+        // A zero in `cost` is observed data ("explicit zero-cost rows remain
+        // priced"), not a missing value: re-estimating it would invent a
+        // charge for a free or local model. Only a NULL cost is tokscale's to
+        // price.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cherrystudio.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                 id TEXT PRIMARY KEY, record_kind TEXT, message_kind TEXT, message_id TEXT,
+                 provider_id TEXT, model_id TEXT, input_tokens INTEGER, output_tokens INTEGER,
+                 cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER,
+                 cost REAL, created_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_usage_record VALUES
+                ('free','invocation','chat',NULL,'ollama','llama3',100,10,0,0,0,0.0,1780000000000),
+                ('unpriced','invocation','chat',NULL,'deepseek','deepseek-flash',100,10,0,0,0,NULL,1780000000000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_cherrystudio_sqlite(&path);
+        assert_eq!(messages.len(), 2);
+        let free = messages
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("cherrystudio-sqlite:free"))
+            .expect("the zero-cost row is reported");
+        let unpriced = messages
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("cherrystudio-sqlite:unpriced"))
+            .expect("the NULL-cost row is reported");
+        // An explicit zero cost is authoritative, not a missing value.
+        assert_eq!(free.cost_source, CostSource::ProviderReported);
+        assert_eq!(free.cost, 0.0);
+        // A NULL cost is left for tokscale's own pricing to estimate.
+        assert_eq!(unpriced.cost_source, CostSource::Estimated);
     }
 
     #[test]
